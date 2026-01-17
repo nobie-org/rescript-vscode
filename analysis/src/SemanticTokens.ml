@@ -28,6 +28,10 @@ module Token = struct
     | EnumMember  (** variant A or poly variant #A *)
     | Property  (** {x:...} *)
     | JsxLowercase  (** div in <div> *)
+    | Function  (** function definitions and calls *)
+    | Parameter  (** function parameters ~name *)
+    | TypeParameter  (** type variables 'a, 'b *)
+    | Decorator  (** @module, @react.component, etc. *)
 
   let tokenTypeToString = function
     | Operator -> "0"
@@ -38,6 +42,10 @@ module Token = struct
     | EnumMember -> "5"
     | Property -> "6"
     | JsxLowercase -> "7"
+    | Function -> "8"
+    | Parameter -> "9"
+    | TypeParameter -> "10"
+    | Decorator -> "11"
 
   let tokenTypeDebug = function
     | Operator -> "Operator"
@@ -48,8 +56,27 @@ module Token = struct
     | EnumMember -> "EnumMember"
     | Property -> "Property"
     | JsxLowercase -> "JsxLowercase"
+    | Function -> "Function"
+    | Parameter -> "Parameter"
+    | TypeParameter -> "TypeParameter"
+    | Decorator -> "Decorator"
 
-  let tokenModifiersString = "0" (* None at the moment *)
+  (* Token modifiers are encoded as a bitmask *)
+  type tokenModifier =
+    | Declaration  (** 1 << 0 = 1 *)
+    | Async  (** 1 << 1 = 2 *)
+    | Deprecated  (** 1 << 2 = 4 *)
+
+  let tokenModifierValue = function
+    | Declaration -> 1
+    | Async -> 2
+    | Deprecated -> 4
+
+  let tokenModifiersToString modifiers =
+    let value = List.fold_left (fun acc m -> acc lor (tokenModifierValue m)) 0 modifiers in
+    string_of_int value
+
+  let tokenModifiersString = "0" (* Default: no modifiers *)
 
   type token = int * int * int * tokenType
 
@@ -176,6 +203,41 @@ let emitVariable ~id ~debug ~loc emitter =
   if debug then Printf.printf "Variable: %s %s\n" id (Loc.toString loc);
   emitter |> emitFromLoc ~loc ~type_:Variable
 
+let emitFunction ~id ~debug ~loc emitter =
+  if debug then Printf.printf "Function: %s %s\n" id (Loc.toString loc);
+  emitter |> emitFromLoc ~loc ~type_:Token.Function
+
+let emitParameter ~id ~debug ~loc emitter =
+  if debug then Printf.printf "Parameter: %s %s\n" id (Loc.toString loc);
+  emitter |> emitFromLoc ~loc ~type_:Token.Parameter
+
+let emitTypeParameter ~name ~debug ~loc emitter =
+  if debug then Printf.printf "TypeParameter: %s %s\n" name (Loc.toString loc);
+  emitter |> emitFromLoc ~loc ~type_:Token.TypeParameter
+
+let emitDecorator ~name ~debug ~(loc : Location.t) emitter =
+  (* The attribute location includes the prefix (@ / @@ / % / %%), but the attribute
+     name (`name`) does not. To align with TextMate scopes (which typically apply
+     `entity.name.function` to the name part only), we shift the start position so
+     the emitted token covers only the name. *)
+  let (lineStart, colStart), (lineEnd, colEnd) = Loc.range loc in
+  let nameLen = String.length name in
+  if lineStart = lineEnd then (
+    let totalLen = colEnd - colStart in
+    let prefixLen = max 0 (totalLen - nameLen) in
+    let adjustedLoc =
+      {
+        loc with
+        loc_start = {loc.loc_start with pos_cnum = loc.loc_start.pos_cnum + prefixLen};
+      }
+    in
+    if debug then Printf.printf "Decorator: %s %s\n" name (Loc.toString adjustedLoc);
+    emitter |> emitFromLoc ~loc:adjustedLoc ~type_:Token.Decorator
+  ) else (
+    if debug then Printf.printf "Decorator: %s %s\n" name (Loc.toString loc);
+    emitter |> emitFromLoc ~loc ~type_:Token.Decorator
+  )
+
 let emitJsxOpen ~lid ~debug ~(loc : Location.t) emitter =
   if not loc.loc_ghost then
     emitter |> emitLongident ~pos:(Loc.start loc) ~lid ~jsx:true ~debug
@@ -214,6 +276,11 @@ let command ~debug ~emitter ~path =
     | Ptyp_constr ({txt = lid; loc}, args) ->
       emitter |> emitType ~lid ~debug ~loc;
       args |> List.iter processTypeArg;
+      Ast_iterator.default_iterator.typ iterator coreType
+    | Ptyp_var name ->
+      (* Type variables like 'a, 'b *)
+      if not coreType.ptyp_loc.loc_ghost then
+        emitter |> emitTypeParameter ~name ~debug ~loc:coreType.ptyp_loc;
       Ast_iterator.default_iterator.typ iterator coreType
     | _ -> Ast_iterator.default_iterator.typ iterator coreType
   in
@@ -427,9 +494,23 @@ let command ~debug ~emitter ~path =
     Ast_iterator.default_iterator.signature_item iterator item
   in
 
+  let attribute (iterator : Ast_iterator.iterator)
+      ((id, _payload) : Parsetree.attribute) =
+    let name = id.txt in
+    let loc = id.loc in
+    (* Skip internal parser attributes that start with "res." *)
+    let isInternalAttr = 
+      String.length name >= 4 && String.sub name 0 4 = "res." 
+    in
+    if not loc.loc_ghost && not isInternalAttr then
+      emitter |> emitDecorator ~name ~debug ~loc;
+    Ast_iterator.default_iterator.attribute iterator (id, _payload)
+  in
+
   let iterator =
     {
       Ast_iterator.default_iterator with
+      attribute;
       constructor_declaration;
       expr;
       label_declaration;

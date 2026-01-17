@@ -41,6 +41,19 @@
           ],
           "type": [
             "support.type.primitive"
+          ],
+          "function": [
+            "entity.name.function"
+          ],
+          "parameter": [
+            "variable.parameter"
+          ],
+          "typeParameter": [
+            "support.type.primitive"
+          ],
+          "decorator": [
+            "entity.name.function.decorator",
+            "meta.decorator"
           ]
         }
       }

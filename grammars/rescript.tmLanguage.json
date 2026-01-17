@@ -33,6 +33,17 @@
         }
       ]
     },
+    "label": {
+      "patterns": [
+        {
+          "match": "(~)([a-z_][0-9A-Za-z_']*)",
+          "captures": {
+            "1": { "name": "punctuation.definition.keyword" },
+            "2": { "name": "variable.parameter" }
+          }
+        }
+      ]
+    },
     "RE_CONSTANTS_BOOL": {
       "name": "constant.language.boolean",
       "match": "\\b(false|true)\\b"
@@ -111,6 +122,9 @@
       "patterns": [
         {
           "include": "#RE_TO_DOWNTO_AS_LABELS"
+        },
+        {
+          "include": "#label"
         },
         {
           "include": "#RE_KEYWORD_CONTROL"

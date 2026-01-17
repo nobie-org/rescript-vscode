@@ -883,6 +883,225 @@ async function semanticTokens(msg: p.RequestMessage) {
     /* projectRequired */ false,
   );
   fs.unlink(tmpname, () => null);
+
+  // Augment semantic tokens with decorator tokens.
+  //
+  // Why: For ReScript >= 12, semantic tokens come from the compiler's analysis binary.
+  // That binary may not emit tokens for ReScript attributes/decorators (e.g. `@module`,
+  // `@react.component`), but we still want stable highlighting in the editor.
+  //
+  // Constraints: LSP semantic tokens MUST be sorted and MUST NOT overlap.
+  try {
+    // Only process successful semanticTokens responses.
+    const result: any = (response as any)?.result;
+    const data: number[] | undefined = Array.isArray(result?.data)
+      ? result.data
+      : undefined;
+    if (data != null) {
+      type AbsToken = {
+        line: number;
+        char: number;
+        length: number;
+        tokenType: number;
+        tokenModifiers: number;
+      };
+
+      const decode = (encoded: number[]): AbsToken[] => {
+        let i = 0;
+        let line = 0;
+        let char = 0;
+        const out: AbsToken[] = [];
+        while (i + 4 < encoded.length) {
+          const deltaLine = encoded[i++];
+          const deltaChar = encoded[i++];
+          const length = encoded[i++];
+          const tokenType = encoded[i++];
+          const tokenModifiers = encoded[i++];
+          if (deltaLine > 0) {
+            line += deltaLine;
+            char = deltaChar;
+          } else {
+            char += deltaChar;
+          }
+          out.push({ line, char, length, tokenType, tokenModifiers });
+        }
+        return out;
+      };
+
+      const encode = (tokens: AbsToken[]): number[] => {
+        let prevLine = 0;
+        let prevChar = 0;
+        const out: number[] = [];
+        for (const t of tokens) {
+          const deltaLine = t.line - prevLine;
+          const deltaChar = deltaLine === 0 ? t.char - prevChar : t.char;
+          out.push(deltaLine, deltaChar, t.length, t.tokenType, t.tokenModifiers);
+          prevLine = t.line;
+          prevChar = t.char;
+        }
+        return out;
+      };
+
+      const overlaps = (a: AbsToken, b: AbsToken): boolean => {
+        if (a.line !== b.line) return false;
+        const aStart = a.char;
+        const aEnd = a.char + a.length;
+        const bStart = b.char;
+        const bEnd = b.char + b.length;
+        return aStart < bEnd && bStart < aEnd;
+      };
+
+      const existing = decode(data).sort((a, b) =>
+        a.line !== b.line ? a.line - b.line : a.char - b.char,
+      );
+
+      // Build a quick per-line index for overlap checks.
+      const byLine = new Map<number, AbsToken[]>();
+      for (const t of existing) {
+        const arr = byLine.get(t.line);
+        if (arr == null) {
+          byLine.set(t.line, [t]);
+        } else {
+          arr.push(t);
+        }
+      }
+      for (const arr of byLine.values()) {
+        arr.sort((a, b) => a.char - b.char);
+      }
+
+      // `decorator` tokenType is index 11 in our legend.
+      const DECORATOR_TOKEN_TYPE = 11;
+      // tokenModifiers legend: ["declaration"(0), "async"(1), "deprecated"(2)]
+      const MODIFIER_DEPRECATED = 1 << 2;
+      // `parameter` tokenType is index 9 in our legend.
+      const PARAMETER_TOKEN_TYPE = 9;
+      // `variable` tokenType is index 1 in our legend.
+      const VARIABLE_TOKEN_TYPE = 1;
+
+      // Reclassify labeled arguments (~foo) from variable -> parameter when possible.
+      // This is important because labels are hard to derive from the compiler AST tokens,
+      // and many themes color parameters differently.
+      //
+      // We prefer an EXACT token match (same line/char/length). If that doesn't exist,
+      // we fall back to rewriting a VARIABLE token that overlaps the label span.
+      // (This avoids creating overlapping tokens, since we only mutate existing ones.)
+      const rewriteTokenTypeForSpan = (
+        line: number,
+        char: number,
+        length: number,
+        fromType: number,
+        toType: number,
+      ) => {
+        const lineTokens = byLine.get(line);
+        if (lineTokens == null) return;
+
+        // 1) Exact match
+        for (const t of lineTokens) {
+          if (
+            t.line === line &&
+            t.char === char &&
+            t.length === length &&
+            t.tokenType === fromType
+          ) {
+            t.tokenType = toType;
+            return;
+          }
+        }
+
+        // 2) Overlapping variable token (best-effort; still safe because we only mutate)
+        const span: AbsToken = {
+          line,
+          char,
+          length,
+          tokenType: fromType,
+          tokenModifiers: 0,
+        };
+        for (const t of lineTokens) {
+          if (t.tokenType !== fromType) continue;
+          if (!overlaps(span, t)) continue;
+          t.tokenType = toType;
+          return;
+        }
+      };
+
+      // Match ReScript attributes/decorators.
+      // Examples:
+      // - @module("x")
+      // - @@foo
+      // - %%raw
+      // Keep it conservative: only ascii identifiers and dots (e.g. react.component).
+      const decoratorRegex = /(@@?|%%?)([A-Za-z_][A-Za-z0-9_\.]*)/g;
+      const added: AbsToken[] = [];
+
+      const lines = code.split(/\r?\n/);
+      for (let line = 0; line < lines.length; line++) {
+        const text = lines[line];
+
+        // Labeled arguments (definition + call sites).
+        // Example: (~name, ~age=?, ~cb) or foo(~name="x")
+        // Capture the identifier part only, excluding the "~".
+        //
+        // NOTE: This doesn't try to parse full syntax; it's a best-effort heuristic.
+        const labelRegex = /~([a-z_][0-9A-Za-z_']*)/g;
+        labelRegex.lastIndex = 0;
+        let lm: RegExpExecArray | null;
+        while ((lm = labelRegex.exec(text)) != null) {
+          const name = lm[1];
+          const startChar = lm.index + 1; // skip "~"
+          // Prefer rewriting an existing variable token (from compiler) into a parameter token.
+          rewriteTokenTypeForSpan(
+            line,
+            startChar,
+            name.length,
+            VARIABLE_TOKEN_TYPE,
+            PARAMETER_TOKEN_TYPE,
+          );
+        }
+
+        decoratorRegex.lastIndex = 0;
+        let m: RegExpExecArray | null;
+        while ((m = decoratorRegex.exec(text)) != null) {
+          const prefix = m[1];
+          const name = m[2];
+          // Emit token for the name only (without @/@@/%%), so selecting the identifier
+          // shows the semantic token in the inspector.
+          const startChar = m.index + prefix.length;
+          const token: AbsToken = {
+            line,
+            char: startChar,
+            length: name.length,
+            tokenType: DECORATOR_TOKEN_TYPE,
+            tokenModifiers: name === "deprecated" ? MODIFIER_DEPRECATED : 0,
+          };
+
+          const lineTokens = byLine.get(line) ?? [];
+          let hasOverlap = false;
+          for (const t of lineTokens) {
+            if (overlaps(token, t)) {
+              hasOverlap = true;
+              break;
+            }
+          }
+          if (!hasOverlap) {
+            added.push(token);
+            lineTokens.push(token);
+            lineTokens.sort((a, b) => a.char - b.char);
+            byLine.set(line, lineTokens);
+          }
+        }
+      }
+
+      if (added.length > 0) {
+        const merged = [...existing, ...added].sort((a, b) =>
+          a.line !== b.line ? a.line - b.line : a.char - b.char,
+        );
+        (response as any).result = { ...result, data: encode(merged) };
+      }
+    }
+  } catch {
+    // Swallow any augmentation errors and fall back to the original semantic tokens.
+  }
+
   return response;
 }
 
@@ -1549,16 +1768,24 @@ async function onMessage(msg: p.Message) {
           semanticTokensProvider: {
             legend: {
               tokenTypes: [
-                "operator",
-                "variable",
-                "type",
-                "modifier", // emit jsx-tag < and > in <div> as modifier
-                "namespace",
-                "enumMember",
-                "property",
-                "interface", // emit jsxlowercase, div in <div> as interface
+                "operator",      // 0: < and > operators
+                "variable",      // 1: let bindings
+                "type",          // 2: type names
+                "modifier",      // 3: jsx-tag < and > in <div>
+                "namespace",     // 4: modules
+                "enumMember",    // 5: variants
+                "property",      // 6: record fields
+                "interface",     // 7: jsxlowercase (div in <div>)
+                "function",      // 8: function definitions and calls
+                "parameter",     // 9: function parameters
+                "typeParameter", // 10: type variables 'a, 'b
+                "decorator",     // 11: @module, @react.component, etc.
               ],
-              tokenModifiers: [],
+              tokenModifiers: [
+                "declaration",   // 0: where something is defined
+                "async",         // 1: async functions
+                "deprecated",    // 2: @deprecated items
+              ],
             },
             documentSelector: [{ scheme: "file", language: "rescript" }],
             // TODO: Support range for full, and add delta support

@@ -136,13 +136,20 @@ export function removeIncrementalFileFolder(
 
 export function recreateIncrementalFileFolder(projectRootPath: NormalizedPath) {
   getLogger().log("Recreating incremental file folder");
-  removeIncrementalFileFolder(projectRootPath, () => {
-    fs.mkdir(
-      path.resolve(projectRootPath, INCREMENTAL_FILE_FOLDER_LOCATION),
-      { recursive: true },
-      (_) => {},
-    );
-  });
+  // Keep this synchronous to avoid races with compileContents writing incremental files.
+  // Async rm/mkdir can remove files between writeFileSync and bsc invocation.
+  try {
+    fs.rmSync(path.resolve(projectRootPath, INCREMENTAL_FILE_FOLDER_LOCATION), {
+      force: true,
+      recursive: true,
+    });
+  } catch {}
+
+  try {
+    fs.mkdirSync(path.resolve(projectRootPath, INCREMENTAL_FILE_FOLDER_LOCATION), {
+      recursive: true,
+    });
+  } catch {}
 }
 
 export function cleanUpIncrementalFiles(

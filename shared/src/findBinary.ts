@@ -59,7 +59,10 @@ export const findBinary = async ({
   platformPath,
 }: FindBinaryOptions): Promise<string | null> => {
   if (platformPath != null) {
-    const result = path.join(platformPath, binary);
+    const platformRoot = path.isAbsolute(platformPath)
+      ? platformPath
+      : path.resolve(projectRootPath ?? process.cwd(), platformPath);
+    const result = path.join(platformRoot, binary);
     return normalizePath(result);
   }
 
